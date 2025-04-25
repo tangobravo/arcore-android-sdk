@@ -23,6 +23,7 @@ import android.opengl.GLES30;
 import android.opengl.GLSurfaceView;
 import android.opengl.Matrix;
 import android.os.Bundle;
+import android.os.Trace;
 import android.util.Log;
 import android.view.MenuItem;
 import android.view.MotionEvent;
@@ -124,7 +125,9 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
   private final SnackbarHelper messageSnackbarHelper = new SnackbarHelper();
   private DisplayRotationHelper displayRotationHelper;
   private final TrackingStateHelper trackingStateHelper = new TrackingStateHelper(this);
-  private TapHelper tapHelper;
+  private boolean touchDown;
+  private float touchX;
+  private float touchY;
   private SampleRender render;
 
   private PlaneRenderer planeRenderer;
@@ -185,8 +188,9 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
     displayRotationHelper = new DisplayRotationHelper(/* context= */ this);
 
     // Set up touch listener.
-    tapHelper = new TapHelper(/* context= */ this);
-    surfaceView.setOnTouchListener(tapHelper);
+    surfaceView.setOnTouchListener((view, motionEvent) -> {
+      return onSurfaceViewTouchEvent(motionEvent);
+    });
 
     // Set up renderer.
     render = new SampleRender(surfaceView, this, getAssets());
@@ -514,8 +518,8 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
       }
     }
 
-    // Handle one tap per frame.
-    handleTap(frame, camera);
+    // Handle one touch per frame.
+    handleTouch(frame, camera);
 
     // Keep the screen unlocked while tracking, but allow it to lock when tracking stops.
     trackingStateHelper.updateKeepScreenOnFlag(camera.getTrackingState());
@@ -624,16 +628,40 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
     backgroundRenderer.drawVirtualScene(render, virtualSceneFramebuffer, Z_NEAR, Z_FAR);
   }
 
-  // Handle only one tap per frame, as taps are usually low frequency compared to frame rate.
-  private void handleTap(Frame frame, Camera camera) {
-    MotionEvent tap = tapHelper.poll();
-    if (tap != null && camera.getTrackingState() == TrackingState.TRACKING) {
+  synchronized private boolean onSurfaceViewTouchEvent(MotionEvent ev) {
+    int action = ev.getActionMasked();
+    if(action == MotionEvent.ACTION_DOWN || action == MotionEvent.ACTION_MOVE ) {
+        touchDown = true;
+        touchX = ev.getX();
+        touchY = ev.getY();
+        return true;
+    }
+
+    if(action == MotionEvent.ACTION_UP) {
+      touchDown = false;
+      touchX = ev.getX();
+      touchY = ev.getY();
+    }
+
+    return false;
+  }
+
+  private void handleTouch(Frame frame, Camera camera) {
+    float latestTouchX;
+    float latestTouchY;
+    synchronized (this) {
+      if(!touchDown) return;
+      latestTouchX = touchX;
+      latestTouchY = touchY;
+    }
+
+    if (camera.getTrackingState() == TrackingState.TRACKING) {
       List<HitResult> hitResultList;
       if (instantPlacementSettings.isInstantPlacementEnabled()) {
         hitResultList =
-            frame.hitTestInstantPlacement(tap.getX(), tap.getY(), APPROXIMATE_DISTANCE_METERS);
+            frame.hitTestInstantPlacement(latestTouchX, latestTouchY, APPROXIMATE_DISTANCE_METERS);
       } else {
-        hitResultList = frame.hitTest(tap);
+        hitResultList = frame.hitTest(latestTouchX, latestTouchY);
       }
       for (HitResult hit : hitResultList) {
         // If any plane, Oriented Point, or Instant Placement Point was hit, create an anchor.
@@ -643,22 +671,46 @@ public class HelloArActivity extends AppCompatActivity implements SampleRender.R
         if ((trackable instanceof Plane
                 && ((Plane) trackable).isPoseInPolygon(hit.getHitPose())
                 && (PlaneRenderer.calculateDistanceToPlane(hit.getHitPose(), camera.getPose()) > 0))
-            || (trackable instanceof Point
-                && ((Point) trackable).getOrientationMode()
-                    == OrientationMode.ESTIMATED_SURFACE_NORMAL)
-            || (trackable instanceof InstantPlacementPoint)
-            || (trackable instanceof DepthPoint)) {
-          // Cap the number of objects created. This avoids overloading both the
-          // rendering system and ARCore.
-          if (wrappedAnchors.size() >= 20) {
-            wrappedAnchors.get(0).getAnchor().detach();
-            wrappedAnchors.remove(0);
-          }
+//            || (trackable instanceof Point
+//                && ((Point) trackable).getOrientationMode()
+//                    == OrientationMode.ESTIMATED_SURFACE_NORMAL)
+//            || (trackable instanceof InstantPlacementPoint)
+//            || (trackable instanceof DepthPoint)
+        ) {
 
           // Adding an Anchor tells ARCore that it should track this position in
           // space. This anchor is created on the Plane to place the 3D model
           // in the correct position relative both to the world and to the plane.
-          wrappedAnchors.add(new WrappedAnchor(hit.createAnchor(), trackable));
+          if(trackable.getTrackingState() == TrackingState.TRACKING) {
+            Anchor newAnchor = null;
+            long createStart = System.nanoTime();
+            Trace.beginSection("Create Anchor");
+            try {
+              newAnchor = hit.createAnchor();
+            } catch (Exception ex) {
+              Log.e(TAG, "Exception thrown during createAnchor");
+              ex.printStackTrace();
+            }
+            Trace.endSection();
+            float createTimeMs = 1e-6f * (System.nanoTime() - createStart);
+            String timeMsg = String.format("Create anchor took %.1f ms", createTimeMs);
+            Log.println(createTimeMs > 10 ? Log.WARN : Log.INFO, TAG, timeMsg);
+
+            if(newAnchor != null) {
+              wrappedAnchors.add(new WrappedAnchor(newAnchor, trackable));
+            }
+          }
+
+          // Detach oldest anchor to cap the number of objects created. This avoids overloading both
+          // the rendering system and ARCore.
+          if (wrappedAnchors.size() >= 2) {
+            Anchor a = wrappedAnchors.get(0).getAnchor();
+            Trace.beginSection("Detach Anchor");
+            a.detach();
+            Trace.endSection();
+            wrappedAnchors.remove(0);
+          }
+
           // For devices that support the Depth API, shows a dialog to suggest enabling
           // depth-based occlusion. This dialog needs to be spawned on the UI thread.
           this.runOnUiThread(this::showOcclusionDialogIfNeeded);
